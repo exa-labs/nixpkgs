@@ -135,11 +135,43 @@ FromImage = namedtuple("FromImage", ["tar", "manifest_json", "image_json"])
 # Some metadata for a layer
 LayerInfo = namedtuple("LayerInfo", ["size", "checksum", "path", "paths"])
 
+# Cache format version to invalidate old entries if layout changes
+CACHE_VERSION = "v1"
 
-def _produce_layer(write_fd, checksum, paths, mtime, uid, gid, uname, gname):
+
+class MultiWriter:
+    def __init__(self, writers):
+        self._writers = writers
+
+    def write(self, data):
+        for w in self._writers:
+            w.write(data)
+
+
+def _produce_layer(
+    write_fd,
+    checksum,
+    paths,
+    mtime,
+    uid,
+    gid,
+    uname,
+    gname,
+    cache_tmp_path=None,
+):
     prod_start = time.monotonic()
     with os.fdopen(write_fd, "wb") as write:
-        archive_paths_to(write, paths, mtime, uid, gid, uname, gname)
+        writers = [write]
+        cache_file = None
+        try:
+            if cache_tmp_path is not None:
+                os.makedirs(os.path.dirname(cache_tmp_path), exist_ok=True)
+                cache_file = open(cache_tmp_path, "wb")
+                writers.append(cache_file)
+            archive_paths_to(MultiWriter(writers), paths, mtime, uid, gid, uname, gname)
+        finally:
+            if cache_file is not None:
+                cache_file.close()
     prod_dur = time.monotonic() - prod_start
     print(
         f"Layer {checksum[:12]}: producer {prod_dur:.3f}s",
@@ -166,6 +198,63 @@ def compute_layer_checksum(paths, mtime, uid, gid, uname, gname, store_dir):
     checksum, size = sink.extract()
     dur = time.monotonic() - start
     return (checksum, size, dur)
+
+
+def compute_layer_checksum_indexed(args):
+    """
+    Wrapper to compute checksum including the original index for result placement.
+    args: (index, paths, mtime, uid, gid, uname, gname, store_dir)
+    Returns: (index, checksum, size, duration_s)
+    """
+    (
+        index,
+        paths,
+        mtime,
+        uid,
+        gid,
+        uname,
+        gname,
+        store_dir,
+    ) = args
+    checksum, size, dur = compute_layer_checksum(
+            paths,
+            mtime,
+            uid, 
+            gid, 
+            uname, 
+            gname, 
+            store_dir
+    )
+    return (index, checksum, size, dur)
+
+
+def get_default_cache_dir():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "nix-docker-layers")
+
+
+def make_layer_cache_key(paths, mtime, uid, gid, uname, gname):
+    key_obj = {
+        "v": CACHE_VERSION,
+        # Preserve order: tar output depends on the order of top-level paths
+        "paths": list(paths),
+        "mtime": mtime,
+        "uid": uid,
+        "gid": gid,
+        "uname": uname,
+        "gname": gname,
+    }
+    key_json = json.dumps(key_obj, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(key_json.encode("utf-8")).hexdigest()
+
+
+def cache_entry_paths(cache_root, cache_key):
+    dir_path = os.path.join(cache_root, CACHE_VERSION, cache_key)
+    return (
+        dir_path,
+        os.path.join(dir_path, "layer.tar"),
+        os.path.join(dir_path, "checksum"),
+    )
 
 
 def load_from_image(from_image_str):
@@ -297,7 +386,50 @@ def add_layer_dir(
     layer_tarinfo.size = size
     layer_tarinfo.mtime = mtime
 
-    # Then actually stream the contents to the outer tarball.
+    # Cache lookup
+    cache_root = get_default_cache_dir()
+    cache_key = make_layer_cache_key(paths, mtime, uid, gid, uname, gname)
+    cache_dir, cache_tar_path, cache_checksum_path = cache_entry_paths(
+        cache_root, cache_key
+    )
+
+    cached = False
+    if os.path.exists(cache_tar_path) and os.path.exists(cache_checksum_path):
+        try:
+            with open(cache_checksum_path) as cf:
+                cached_checksum = cf.read().strip()
+            if cached_checksum == checksum:
+                stat = os.stat(cache_tar_path)
+                if stat.st_size == size:
+                    cached = True
+                    print(
+                        f"Layer {checksum[:12]}: cache hit at {cache_tar_path}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        except Exception as e:
+            print(
+                f"Layer {checksum[:12]}: cache check failed: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    if cached:
+        print(
+            f"Layer {checksum[:12]}: start addfile (cached)",
+            file=sys.stderr,
+            flush=True,
+        )
+        with open(cache_tar_path, "rb") as read:
+            tar.addfile(layer_tarinfo, read)
+        print(
+            f"Layer {checksum[:12]}: addfile done (cached) bytes={size}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return LayerInfo(size=size, checksum=checksum, path=path, paths=paths)
+
+    # Then actually stream the contents to the outer tarball, while staging cache
     read_fd, write_fd = os.pipe()
 
     print(
@@ -307,9 +439,23 @@ def add_layer_dir(
     )
 
     ctx = multiprocessing.get_context("fork")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_tmp_path = os.path.join(
+        cache_dir, f"layer.tar.tmp-{os.getpid()}-{time.time_ns()}"
+    )
     proc = ctx.Process(
         target=_produce_layer,
-        args=(write_fd, checksum, paths, mtime, uid, gid, uname, gname),
+        args=(
+            write_fd,
+            checksum,
+            paths,
+            mtime,
+            uid,
+            gid,
+            uname,
+            gname,
+            cache_tmp_path,
+        ),
         daemon=True,
     )
     proc.start()
@@ -326,9 +472,35 @@ def add_layer_dir(
     )
     proc.join()
     if proc.exitcode != 0:
+        try:
+            if os.path.exists(cache_tmp_path):
+                os.remove(cache_tmp_path)
+        except Exception:
+            pass
         raise RuntimeError(
-            f"Layer {checksum[:12]}: producer exited with code "
-            f"{proc.exitcode}"
+            f"Layer {checksum[:12]}: producer exited with code {proc.exitcode}"
+        )
+
+    # Finalize cache entry atomically
+    try:
+        os.replace(cache_tmp_path, cache_tar_path)
+        with open(cache_checksum_path, "w") as cf:
+            cf.write(checksum)
+        print(
+            f"Layer {checksum[:12]}: cached at {cache_tar_path}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as e:
+        try:
+            if os.path.exists(cache_tmp_path):
+                os.remove(cache_tmp_path)
+        except Exception:
+            pass
+        print(
+            f"Layer {checksum[:12]}: cache store failed: {e}",
+            file=sys.stderr,
+            flush=True,
         )
 
     return LayerInfo(size=size, checksum=checksum, path=path, paths=paths)
@@ -443,19 +615,37 @@ Docker Image Specification v1.2 as reference [1].
         start = len(layers) + 1
         store_layers = conf["store_layers"]
         print("Precomputing layer hashes...", file=sys.stderr)
-        with ProcessPoolExecutor(max_workers=64) as exe:
-            precomputed = list(
-                exe.map(
-                    compute_layer_checksum,
-                    store_layers,
-                    itertools.repeat(mtime),
-                    itertools.repeat(uid),
-                    itertools.repeat(gid),
-                    itertools.repeat(uname),
-                    itertools.repeat(gname),
-                    itertools.repeat(store_dir),
-                )
-            )
+        # Compute pre-hashes in parallel only for cache misses
+        cache_root = get_default_cache_dir()
+        indexed = list(enumerate(store_layers))
+        hits = {}
+        misses_args = []
+        for idx, layer_paths in indexed:
+            key = make_layer_cache_key(layer_paths, mtime, uid, gid, uname, gname)
+            _, cache_tar_path, cache_checksum_path = cache_entry_paths(cache_root, key)
+            if os.path.exists(cache_tar_path) and os.path.exists(cache_checksum_path):
+                try:
+                    with open(cache_checksum_path) as cf:
+                        ch = cf.read().strip()
+                    st = os.stat(cache_tar_path)
+                    hits[idx] = (ch, st.st_size, 0.0)
+                    continue
+                except Exception:
+                    pass
+            misses_args.append((idx, layer_paths, mtime, uid, gid, uname, gname, store_dir))
+
+        workers = min(max(1, (os.cpu_count() or 1) - 1), len(misses_args) or 1)
+        print(
+            f"Precomputing layer hashes with {workers} worker(s); cache hits: {len(hits)}",
+            file=sys.stderr,
+        )
+        precomputed = [None] * len(store_layers)
+        for idx, val in hits.items():
+            precomputed[idx] = val
+        if len(misses_args) > 0:
+            with ProcessPoolExecutor(max_workers=workers) as exe:
+                for idx, ch, sz, dur in exe.map(compute_layer_checksum_indexed, misses_args):
+                    precomputed[idx] = (ch, sz, dur)
         print(
             f"Precomputed hashes for {len(precomputed)} layers",
             file=sys.stderr,
