@@ -43,6 +43,7 @@ import pathlib
 import tarfile
 import itertools
 import threading
+import time
 from datetime import datetime, timezone
 from collections import namedtuple
 
@@ -230,9 +231,21 @@ def add_layer_dir(tar, paths, store_dir, mtime, uid, gid, uname, gname):
     ), f"Expecting absolute paths from {store_dir}, but got: {invalid_paths}"
 
     # First, calculate the tarball checksum and the size.
+    hash_start = time.monotonic()
+    print(
+        f"Layer: hashing start for {len(paths)} path(s)",
+        file=sys.stderr,
+        flush=True,
+    )
     extract_checksum = ExtractChecksum()
     archive_paths_to(extract_checksum, paths, mtime, uid, gid, uname, gname)
     (checksum, size) = extract_checksum.extract()
+    hash_dur = time.monotonic() - hash_start
+    print(
+        f"Layer {checksum[:12]}: hashing done in {hash_dur:.3f}s (size={size} bytes)",
+        file=sys.stderr,
+        flush=True,
+    )
 
     path = f"{checksum}/layer.tar"
     layer_tarinfo = tarfile.TarInfo(path)
@@ -244,8 +257,15 @@ def add_layer_dir(tar, paths, store_dir, mtime, uid, gid, uname, gname):
     with open(read_fd, "rb") as read, open(write_fd, "wb") as write:
 
         def producer():
+            prod_start = time.monotonic()
             archive_paths_to(write, paths, mtime, uid, gid, uname, gname)
             write.close()
+            prod_dur = time.monotonic() - prod_start
+            print(
+                f"Layer {checksum[:12]}: producer (create layer tar) took {prod_dur:.3f}s",
+                file=sys.stderr,
+                flush=True,
+            )
 
         # Closing the write end of the fifo also closes the read end,
         # so we don't need to wait until this thread is finished.
@@ -253,8 +273,20 @@ def add_layer_dir(tar, paths, store_dir, mtime, uid, gid, uname, gname):
         # Any exception from the thread will get printed by the default
         # exception handler, and the 'addfile' call will fail since it
         # won't be able to read required amount of bytes.
+        print(
+            f"Layer {checksum[:12]}: starting streaming to output tar",
+            file=sys.stderr,
+            flush=True,
+        )
+        consume_start = time.monotonic()
         threading.Thread(target=producer).start()
         tar.addfile(layer_tarinfo, read)
+        consume_dur = time.monotonic() - consume_start
+        print(
+            f"Layer {checksum[:12]}: addfile (copy to outer tar) took {consume_dur:.3f}s (bytes={size})",
+            file=sys.stderr,
+            flush=True,
+        )
 
     return LayerInfo(size=size, checksum=checksum, path=path, paths=paths)
 
@@ -374,8 +406,15 @@ Docker Image Specification v1.2 as reference [1].
                 store_layer,
                 file=sys.stderr,
             )
+            layer_total_start = time.monotonic()
             info = add_layer_dir(
                 tar, store_layer, store_dir, mtime, uid, gid, uname, gname
+            )
+            total_dur = time.monotonic() - layer_total_start
+            print(
+                f"Layer {num}: total layer step took {total_dur:.3f}s",
+                file=sys.stderr,
+                flush=True,
             )
             layers.append(info)
 
