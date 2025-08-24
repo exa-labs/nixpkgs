@@ -44,6 +44,7 @@ import tarfile
 import itertools
 import threading
 import time
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from collections import namedtuple
 
@@ -135,6 +136,26 @@ FromImage = namedtuple("FromImage", ["tar", "manifest_json", "image_json"])
 LayerInfo = namedtuple("LayerInfo", ["size", "checksum", "path", "paths"])
 
 
+def compute_layer_checksum(paths, mtime, uid, gid, uname, gname, store_dir):
+    """
+    Compute checksum and size for a layer defined by store paths.
+
+    Returns: (checksum: str, size: int, duration_s: float)
+    """
+    invalid_paths = [i for i in paths if not i.startswith(store_dir)]
+    if len(invalid_paths) != 0:
+        raise AssertionError(
+            f"Expect paths from {store_dir}, got: {invalid_paths}"
+        )
+
+    start = time.monotonic()
+    sink = ExtractChecksum()
+    archive_paths_to(sink, paths, mtime, uid, gid, uname, gname)
+    checksum, size = sink.extract()
+    dur = time.monotonic() - start
+    return (checksum, size, dur)
+
+
 def load_from_image(from_image_str):
     """
     Loads the given base image, if any.
@@ -211,7 +232,9 @@ def overlay_base_config(from_image, final_config):
     return final_config
 
 
-def add_layer_dir(tar, paths, store_dir, mtime, uid, gid, uname, gname):
+def add_layer_dir(
+    tar, paths, store_dir, mtime, uid, gid, uname, gname, precomputed=None
+):
     """
     Appends given store paths to a TarFile object as a new layer.
 
@@ -231,21 +254,31 @@ def add_layer_dir(tar, paths, store_dir, mtime, uid, gid, uname, gname):
     ), f"Expecting absolute paths from {store_dir}, but got: {invalid_paths}"
 
     # First, calculate the tarball checksum and the size.
-    hash_start = time.monotonic()
-    print(
-        f"Layer: hashing start for {len(paths)} path(s)",
-        file=sys.stderr,
-        flush=True,
-    )
-    extract_checksum = ExtractChecksum()
-    archive_paths_to(extract_checksum, paths, mtime, uid, gid, uname, gname)
-    (checksum, size) = extract_checksum.extract()
-    hash_dur = time.monotonic() - hash_start
-    print(
-        f"Layer {checksum[:12]}: hash {hash_dur:.3f}s, size={size}",
-        file=sys.stderr,
-        flush=True,
-    )
+    if precomputed is None:
+        hash_start = time.monotonic()
+        print(
+            f"Layer: hashing start for {len(paths)} path(s)",
+            file=sys.stderr,
+            flush=True,
+        )
+        extract_checksum = ExtractChecksum()
+        archive_paths_to(
+            extract_checksum, paths, mtime, uid, gid, uname, gname
+        )
+        (checksum, size) = extract_checksum.extract()
+        hash_dur = time.monotonic() - hash_start
+        print(
+            f"Layer {checksum[:12]}: hash {hash_dur:.3f}s, size={size}",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        (checksum, size, hash_dur) = precomputed
+        print(
+            f"Layer {checksum[:12]}: pre-hash {hash_dur:.3f}s, size={size}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     path = f"{checksum}/layer.tar"
     layer_tarinfo = tarfile.TarInfo(path)
@@ -398,7 +431,27 @@ Docker Image Specification v1.2 as reference [1].
         layers.extend(add_base_layers(tar, from_image))
 
         start = len(layers) + 1
-        for num, store_layer in enumerate(conf["store_layers"], start=start):
+        store_layers = conf["store_layers"]
+        print("Precomputing layer hashes...", file=sys.stderr)
+        with ProcessPoolExecutor(max_workers=127) as exe:
+            precomputed = list(
+                exe.map(
+                    compute_layer_checksum,
+                    store_layers,
+                    itertools.repeat(mtime),
+                    itertools.repeat(uid),
+                    itertools.repeat(gid),
+                    itertools.repeat(uname),
+                    itertools.repeat(gname),
+                    itertools.repeat(store_dir),
+                )
+            )
+        print(
+            f"Precomputed hashes for {len(precomputed)} layers",
+            file=sys.stderr,
+        )
+
+        for num, store_layer in enumerate(store_layers, start=start):
             print(
                 "Creating layer",
                 num,
@@ -408,7 +461,15 @@ Docker Image Specification v1.2 as reference [1].
             )
             layer_total_start = time.monotonic()
             info = add_layer_dir(
-                tar, store_layer, store_dir, mtime, uid, gid, uname, gname
+                tar,
+                store_layer,
+                store_dir,
+                mtime,
+                uid,
+                gid,
+                uname,
+                gname,
+                precomputed=precomputed[num - start],
             )
             total_dur = time.monotonic() - layer_total_start
             print(
