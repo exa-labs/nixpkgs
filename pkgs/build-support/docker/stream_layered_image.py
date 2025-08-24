@@ -433,7 +433,7 @@ Docker Image Specification v1.2 as reference [1].
         start = len(layers) + 1
         store_layers = conf["store_layers"]
         print("Precomputing layer hashes...", file=sys.stderr)
-        with ProcessPoolExecutor(max_workers=127) as exe:
+        with ProcessPoolExecutor(max_workers=64) as exe:
             precomputed = list(
                 exe.map(
                     compute_layer_checksum,
