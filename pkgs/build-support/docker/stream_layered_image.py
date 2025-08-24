@@ -242,7 +242,7 @@ def add_layer_dir(tar, paths, store_dir, mtime, uid, gid, uname, gname):
     (checksum, size) = extract_checksum.extract()
     hash_dur = time.monotonic() - hash_start
     print(
-        f"Layer {checksum[:12]}: hashing done in {hash_dur:.3f}s (size={size} bytes)",
+        f"Layer {checksum[:12]}: hash {hash_dur:.3f}s, size={size}",
         file=sys.stderr,
         flush=True,
     )
@@ -262,7 +262,7 @@ def add_layer_dir(tar, paths, store_dir, mtime, uid, gid, uname, gname):
             write.close()
             prod_dur = time.monotonic() - prod_start
             print(
-                f"Layer {checksum[:12]}: producer (create layer tar) took {prod_dur:.3f}s",
+                f"Layer {checksum[:12]}: producer {prod_dur:.3f}s",
                 file=sys.stderr,
                 flush=True,
             )
@@ -274,7 +274,7 @@ def add_layer_dir(tar, paths, store_dir, mtime, uid, gid, uname, gname):
         # exception handler, and the 'addfile' call will fail since it
         # won't be able to read required amount of bytes.
         print(
-            f"Layer {checksum[:12]}: starting streaming to output tar",
+            f"Layer {checksum[:12]}: start addfile",
             file=sys.stderr,
             flush=True,
         )
@@ -283,7 +283,7 @@ def add_layer_dir(tar, paths, store_dir, mtime, uid, gid, uname, gname):
         tar.addfile(layer_tarinfo, read)
         consume_dur = time.monotonic() - consume_start
         print(
-            f"Layer {checksum[:12]}: addfile (copy to outer tar) took {consume_dur:.3f}s (bytes={size})",
+            f"Layer {checksum[:12]}: addfile {consume_dur:.3f}s bytes={size}",
             file=sys.stderr,
             flush=True,
         )
@@ -412,7 +412,7 @@ Docker Image Specification v1.2 as reference [1].
             )
             total_dur = time.monotonic() - layer_total_start
             print(
-                f"Layer {num}: total layer step took {total_dur:.3f}s",
+                f"Layer {num}: total {total_dur:.3f}s",
                 file=sys.stderr,
                 flush=True,
             )
