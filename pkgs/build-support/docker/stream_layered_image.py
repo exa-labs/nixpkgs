@@ -327,7 +327,8 @@ def add_layer_dir(
     proc.join()
     if proc.exitcode != 0:
         raise RuntimeError(
-            f"Layer {checksum[:12]}: producer process exited with code {proc.exitcode}"
+            f"Layer {checksum[:12]}: producer exited with code "
+            f"{proc.exitcode}"
         )
 
     return LayerInfo(size=size, checksum=checksum, path=path, paths=paths)
