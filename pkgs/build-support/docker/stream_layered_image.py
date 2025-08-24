@@ -42,8 +42,8 @@ import hashlib
 import pathlib
 import tarfile
 import itertools
-import threading
 import time
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from collections import namedtuple
@@ -134,6 +134,18 @@ class ExtractChecksum:
 FromImage = namedtuple("FromImage", ["tar", "manifest_json", "image_json"])
 # Some metadata for a layer
 LayerInfo = namedtuple("LayerInfo", ["size", "checksum", "path", "paths"])
+
+
+def _produce_layer(write_fd, checksum, paths, mtime, uid, gid, uname, gname):
+    prod_start = time.monotonic()
+    with os.fdopen(write_fd, "wb") as write:
+        archive_paths_to(write, paths, mtime, uid, gid, uname, gname)
+    prod_dur = time.monotonic() - prod_start
+    print(
+        f"Layer {checksum[:12]}: producer {prod_dur:.3f}s",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def compute_layer_checksum(paths, mtime, uid, gid, uname, gname, store_dir):
@@ -287,38 +299,35 @@ def add_layer_dir(
 
     # Then actually stream the contents to the outer tarball.
     read_fd, write_fd = os.pipe()
-    with open(read_fd, "rb") as read, open(write_fd, "wb") as write:
 
-        def producer():
-            prod_start = time.monotonic()
-            archive_paths_to(write, paths, mtime, uid, gid, uname, gname)
-            write.close()
-            prod_dur = time.monotonic() - prod_start
-            print(
-                f"Layer {checksum[:12]}: producer {prod_dur:.3f}s",
-                file=sys.stderr,
-                flush=True,
-            )
+    print(
+        f"Layer {checksum[:12]}: start addfile",
+        file=sys.stderr,
+        flush=True,
+    )
 
-        # Closing the write end of the fifo also closes the read end,
-        # so we don't need to wait until this thread is finished.
-        #
-        # Any exception from the thread will get printed by the default
-        # exception handler, and the 'addfile' call will fail since it
-        # won't be able to read required amount of bytes.
-        print(
-            f"Layer {checksum[:12]}: start addfile",
-            file=sys.stderr,
-            flush=True,
-        )
-        consume_start = time.monotonic()
-        threading.Thread(target=producer).start()
+    ctx = multiprocessing.get_context("fork")
+    proc = ctx.Process(
+        target=_produce_layer,
+        args=(write_fd, checksum, paths, mtime, uid, gid, uname, gname),
+        daemon=True,
+    )
+    proc.start()
+    os.close(write_fd)
+
+    consume_start = time.monotonic()
+    with os.fdopen(read_fd, "rb") as read:
         tar.addfile(layer_tarinfo, read)
-        consume_dur = time.monotonic() - consume_start
-        print(
-            f"Layer {checksum[:12]}: addfile {consume_dur:.3f}s bytes={size}",
-            file=sys.stderr,
-            flush=True,
+    consume_dur = time.monotonic() - consume_start
+    print(
+        f"Layer {checksum[:12]}: addfile {consume_dur:.3f}s bytes={size}",
+        file=sys.stderr,
+        flush=True,
+    )
+    proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(
+            f"Layer {checksum[:12]}: producer process exited with code {proc.exitcode}"
         )
 
     return LayerInfo(size=size, checksum=checksum, path=path, paths=paths)
